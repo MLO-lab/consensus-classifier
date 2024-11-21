@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "cclf"
+version = "0.1.0"
+description = "XGBoost based consensus classifier."
+readme = "README.md"
+authors = ["Arber Qoku <arber.qoku@dkfz-heidelberg.com>"]
+homepage = "https://github.com/MLO-lab/consensus-classifier"
+repository = "https://github.com/MLO-lab/consensus-classifier"
+
+[build-system]
+requires = ["poetry-core>=1.5.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.dependencies]
+python = ">=3.9,<3.11"
+numpy = "^1.26.1"
+pandas = "^2.1.1"
+scikit-learn = "^1.3.1"
+xgboost = "^2.0.1"
+black = "^23.10.1"
+tqdm = "^4.66.1"
+seaborn = "^0.13.0"
+ipywidgets = "^8.1.1"
