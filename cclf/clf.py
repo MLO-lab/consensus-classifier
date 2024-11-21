@@ -1,3 +1,4 @@
+import click
 import logging
 
 import numpy as np
@@ -304,3 +305,64 @@ class ConsensusClassifier:
         if path is not None:
             results.to_csv(path)
         return results
+
+
+
+
+@click.command()
+@click.argument(
+    "data",
+    type=click.Path(exists=True, dir_okay=False),
+    # help="Path to input file (CSV).",
+)
+@click.option(
+    "-m", "--models", default=100, type=int, help="Number of models (default: 100)."
+)
+@click.option(
+    "-f",
+    "--features_per_model",
+    default=200,
+    type=int,
+    help="Number of features for each model (default: 100).",
+)
+@click.option(
+    "--binary/--no-binary",
+    default=True,
+    type=bool,
+    help="Whether to perform a binary classification (PG4 vs rest).",
+)
+@click.option(
+    "--fpkm/--no-fpkm",
+    default=False,
+    type=bool,
+    help="Whether to apply a z-score transformation (FPKM) or use a rank-based approach.",
+)
+@click.option(
+    "--out",
+    default="results.csv",
+    type=click.Path(dir_okay=False, writable=True),
+    help="Name of the CSV file to save results.",
+)
+def classify(data, models, features_per_model, binary, fpkm, out):
+    use_z_scores = fpkm
+    use_ranks = not fpkm
+    seed = 0
+
+    clf = ConsensusClassifier(
+        n_models=models,
+        n_features_per_model=features_per_model,
+        binary=binary,
+        use_ranks=use_ranks,
+        use_z_scores=use_z_scores,
+    )
+    X, y = _read_training_data()
+    clf.add_train_data(X, y)
+    clf.add_test_data(pd.read_csv(data, index_col=0))
+    clf.fit(seed=seed)
+    if out[-4:] != ".csv":
+        out += ".csv"
+    return clf.export_results(out)
+
+
+if __name__ == "__main__":
+    classify()
