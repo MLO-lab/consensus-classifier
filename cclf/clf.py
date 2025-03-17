@@ -29,13 +29,19 @@ class ConsensusClassifier:
     def __init__(
         self,
         n_models=100,
-        n_features_per_model=200,
+        n_samples_per_model=None,
+        n_features_per_model=None,
+        keep_samples=None,
+        keep_features=None,
         use_ranks=True,
         use_z_scores=False,
         verbose=True,
     ):
         self.n_models = n_models
+        self.n_samples_per_model = n_samples_per_model
         self.n_features_per_model = n_features_per_model
+        self.keep_samples = keep_samples
+        self.keep_features = keep_features
         if not use_ranks and not use_z_scores:
             logger.warning("No processing of the data selected, using raw values.")
         if use_ranks and use_z_scores:
@@ -69,6 +75,7 @@ class ConsensusClassifier:
 
         self.X_test = None
 
+        self.sample_subset_list = []
         self.feature_subset_list = []
         self.classifier_list = []
 
@@ -91,7 +98,7 @@ class ConsensusClassifier:
             xgb_config = {
                 "objective": "multi:softprob",
                 "eval_metric": "auc",
-                "num_class": 7,
+                "num_class": self.n_classes,
             }
 
         xgb_config.update(
@@ -165,31 +172,66 @@ class ConsensusClassifier:
         X_train = X_train.loc[:, common_features].copy()
         X_test = X_test.loc[:, common_features].copy()
 
+        if self.keep_features is not None:
+            self.keep_features = [
+                kf for kf in self.keep_features if kf in common_features
+            ]
+
         if (
             self.n_features_per_model is None
+            or self.n_features_per_model <= 0
             or self.n_features_per_model > self.X_train.shape[1]
         ):
             self.n_features_per_model = self.X_train.shape[1]
 
+        if 0 < self.n_features_per_model < 1.0:
+            self.n_features_per_model = int(
+                self.n_features_per_model * self.X_train.shape[1]
+            )
+
+        if self.verbose:
+            logger.info(
+                f"Each model will be trained on {self.n_features_per_model} features."
+            )
+
         return X_train, X_test
 
-    def add_train_data(self, X, y):
+    def add_train_data(self, X, y, y_multi=None):
         # self._reset()
         if self.verbose:
             logger.info("Checking training data...")
+        self.y_multi = y_multi
         self.X_train = self._check_data(X)
         self.y_train = y.copy()
         self.le = LabelEncoder()
         self.le.fit(self.y_train)
-        self.y_train = self.le.transform(self.y_train)
+        self.y_train = pd.Series(
+            self.le.transform(self.y_train), index=self.y_train.index
+        )
         self.n_classes = len(self.le.classes_)
         self.binary = self.n_classes == 2
         self.le_mapping = dict(zip(range(len(self.le.classes_)), self.le.classes_))
+
+        if (
+            self.n_samples_per_model is None
+            or self.n_samples_per_model <= 0
+            or self.n_samples_per_model > self.X_train.shape[0]
+        ):
+            self.n_samples_per_model = self.X_train.shape[0]
+
+        if 0 < self.n_samples_per_model < 1.0:
+            self.n_samples_per_model = int(
+                self.n_samples_per_model * self.X_train.shape[0]
+            )
+
         if self.verbose:
             logger.info(
                 f"Loaded training data with {self.X_train.shape[0]} samples and {self.X_train.shape[1]} features."
             )
             logger.info(f"Found {self.n_classes} classes in the training data.")
+            logger.info(
+                f"Each model will be trained on {self.n_samples_per_model} samples."
+            )
             logger.info(
                 "Finished! Call the `add_test_data` method to load the test data."
             )
@@ -208,33 +250,78 @@ class ConsensusClassifier:
 
         if self.verbose:
             logger.info("Finished! Call the `fit` method to train the classifiers.")
-
+    
     def _fit_classifier(self, X, y, seed, model_idx):
         seed += model_idx
         xgb_config = self.xgb_config
         xgb_config["seed"] = seed
         xgb_clf = xgb.XGBClassifier(**xgb_config)
-        return xgb_clf.fit(
-            X, y, sample_weight=compute_sample_weight(class_weight="balanced", y=y)
-        )
+        
+        # # Compute sample weights for imbalanced classes
+        # sample_weights = compute_sample_weight(class_weight="balanced", y=y)
+
+        # # Convert data to DMatrix format for custom loss function
+        # dtrain = xgb.DMatrix(X, label=y, weight=sample_weights)
+        
+        # loss_function = focal_loss(alpha=0.25, gamma=2.0)
+        # if not self.binary:
+        #     loss_function = focal_loss_multiclass(alpha=0.25, gamma=2.0)
+
+        # # Train using xgb.train() with the custom focal loss function
+        # xgb_clf._Booster = xgb.train(
+        #     params=xgb_config,  # Use the classifier's parameters
+        #     dtrain=dtrain,
+        #     num_boost_round=100,
+        #     obj=loss_function,
+        # )
+        
+        # xgb_clf.n_classes_ = self.n_classes  # Ensures proper class handling
+        # # xgb_clf.classes_ = np.unique(y)  # Fixes `n_classes_` error
+        
+        # return xgb_clf
+        
+        sample_weight = compute_sample_weight(class_weight="balanced", y=y)
+        sample_weight[(y == 1)] = sample_weight[(y == 1)] * self.scaling_factor
+        sample_weight = sample_weight * len(sample_weight) / sample_weight.sum()
+
+        return xgb_clf.fit(X, y, sample_weight=sample_weight)
 
     def fit(self, seed=None):
         rng = np.random.default_rng(seed)
         if self.verbose:
             logger.info("Training the classifiers...")
+        self.sample_subset_list = []
         self.feature_subset_list = []
         self.classifier_list = []
         for model_idx in tqdm(range(self.n_models)):
+
+            sample_subset = []
+            percentage = self.n_samples_per_model / len(self.y_train)
+
+            # Group by class and sample
+            y_train_ = self.y_multi if self.y_multi is not None else self.y_train
+            for label, group in y_train_.groupby(y_train_):
+                n_samples = max(
+                    1, int(len(group) * percentage)
+                )  # At least one sample per class
+                sample_subset.extend(group.sample(n=n_samples).index)
+
+            if self.keep_samples is not None:
+                sample_subset = list(set(sample_subset) | set(self.keep_samples))
+
             feature_subset = rng.choice(
                 self.X_train.columns, size=self.n_features_per_model, replace=False
-            )
+            ).tolist()
+            if self.keep_features is not None:
+                feature_subset = list(set(feature_subset) | set(self.keep_features))
+
+            self.sample_subset_list.append(sample_subset)
             self.feature_subset_list.append(feature_subset)
-            X_train_sub = self.X_train.loc[:, feature_subset]
+            X_train_sub = self.X_train.loc[sample_subset, feature_subset].copy()
+            y_train_sub = self.y_train.loc[sample_subset].copy()
             if self.transform is not None:
                 X_train_sub = self.transform(X_train_sub)
-            classifier = self._fit_classifier(
-                X_train_sub, self.y_train, seed, model_idx
-            )
+            classifier = self._fit_classifier(X_train_sub, y_train_sub, seed, model_idx)
             self.classifier_list.append(classifier)
         if self.verbose:
             logger.info(
@@ -326,12 +413,6 @@ class ConsensusClassifier:
     help="Number of features for each model (default: 100).",
 )
 @click.option(
-    "--binary/--no-binary",
-    default=True,
-    type=bool,
-    help="Whether to perform a binary classification (PG4 vs rest).",
-)
-@click.option(
     "--fpkm/--no-fpkm",
     default=False,
     type=bool,
@@ -343,7 +424,7 @@ class ConsensusClassifier:
     type=click.Path(dir_okay=False, writable=True),
     help="Name of the CSV file to save results.",
 )
-def classify(data, models, features_per_model, binary, fpkm, out):
+def classify(data, models, features_per_model, fpkm, out):
     use_z_scores = fpkm
     use_ranks = not fpkm
     seed = 0
@@ -351,7 +432,6 @@ def classify(data, models, features_per_model, binary, fpkm, out):
     clf = ConsensusClassifier(
         n_models=models,
         n_features_per_model=features_per_model,
-        binary=binary,
         use_ranks=use_ranks,
         use_z_scores=use_z_scores,
     )
