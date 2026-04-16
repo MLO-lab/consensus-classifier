@@ -1,4 +1,3 @@
-import click
 import logging
 
 import numpy as np
@@ -8,61 +7,109 @@ from tqdm import tqdm
 
 import xgboost as xgb
 
-from scipy import stats
-
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler, RobustScaler
 from sklearn.utils.class_weight import compute_sample_weight
 
+try:
+    import ray
+except ImportError:
+    ray = None
 
 logger = logging.getLogger(__name__)
 
 
-def to_ranks(_X, method="first"):
-    return pd.DataFrame(_X).rank(axis=1, method=method)
+def ray_progress_bar(tasks, desc="Training models", verbose=True):
+    """
+    Show tqdm progress bar while waiting for Ray tasks to finish.
+    Returns results from ray.get() in the correct completed order.
+    """
+    remaining = list(tasks)
+    done_results = []
+    pbar = tqdm(total=len(tasks), desc=desc, disable=not verbose)
+
+    while remaining:
+        done, remaining = ray.wait(remaining, num_returns=1)
+        result = ray.get(done[0])
+        done_results.append(result)
+        pbar.update(1)
+
+    pbar.close()
+    return done_results
 
 
-def to_z_scores(_X):
-    return (_X - _X.mean(axis=0)) / _X.std(axis=0)
+def compute_required_features_per_model(
+    total_features: int, n_models: int, target_coverage: float = 0.95
+) -> int:
+    """
+    Compute the number of features that must be sampled per model to achieve
+    a desired expected feature coverage across an ensemble.
 
+    Parameters
+    ----------
+    total_features : int
+        Total number of available features (D).
+    n_models : int
+        Number of ensemble models (M).
+    target_coverage : float
+        Desired coverage level (default: 0.95).
+
+    Returns
+    -------
+    int
+        Minimum required features per model (rounded up).
+    """
+    if not (0 < target_coverage < 1):
+        raise ValueError("target_coverage must be between 0 and 1.")
+
+    D = float(total_features)
+    M = float(n_models)
+
+    k = D * (1 - (1 - target_coverage) ** (1.0 / M))
+    return int(np.ceil(k))
+
+
+def intersect_features(current_features, new_features):
+    return [col for col in new_features if col in current_features]
 
 class ConsensusClassifier:
     def __init__(
         self,
         n_models=100,
         n_samples_per_model=None,
-        n_features_per_model=None,
+        n_features_per_model="auto",
+        scaler=None,  # None | "standard" | "robust"
         keep_samples=None,
         keep_features=None,
-        use_ranks=True,
-        use_z_scores=False,
         verbose=True,
+        xgb_params_override=None,
+        use_ray=False,
     ):
+        if n_models < 1:
+            raise ValueError(f"n_models must be at least 1, got {n_models}.")
         self.n_models = n_models
         self.n_samples_per_model = n_samples_per_model
         self.n_features_per_model = n_features_per_model
+        self.scaler = scaler
         self.keep_samples = keep_samples
         self.keep_features = keep_features
-        if not use_ranks and not use_z_scores:
-            logger.warning("No processing of the data selected, using raw values.")
-        if use_ranks and use_z_scores:
-            raise ValueError("Only one of `use_ranks` and `use_z_scores` can be True.")
-        self.use_ranks = use_ranks
-        self.use_z_scores = use_z_scores
-
-        self.transform = None
-        if self.use_ranks:
-            self.transform = to_ranks
-        if self.use_z_scores:
-            self.transform = to_z_scores
 
         self.verbose = verbose
+        self.log = logger.info if self.verbose else lambda *a, **k: None
 
-        if self.verbose:
-            logger.info("========== Initializing Consensus Classifier ==========")
-            logger.info(
-                "Finished! Call the `add_train_data` method to load the training data."
+        self.log("========== Initializing Consensus Classifier ==========")
+        self.log(
+            "Finished! Call the `add_train_data` method to load the training data."
+        )
+
+        self.xgb_params_override = xgb_params_override
+        if self.xgb_params_override is None:
+            self.xgb_params_override = {}
+        self.use_ray = use_ray
+        if self.use_ray and ray is None:
+            logger.warning(
+                "Ray not available, disabling `use_ray` in ConsensusClassifier."
             )
-
+            self.use_ray = False
         self._reset()
 
     def _reset(self):
@@ -74,77 +121,106 @@ class ConsensusClassifier:
         self.binary = None
 
         self.X_test = None
-
+        self._X_test_cache = {}
+        
+        self.scaler_list = []
         self.sample_subset_list = []
         self.feature_subset_list = []
         self.classifier_list = []
-
+        
         self.probs_list = []
-        self.raw_probs = []
-
-        self.raw_predictions = []
+        self._probs_df = None
+        self._pred_series = None
+        self._vote_series = None
+        self._all_votes_df = None
+        
+    def _make_scaler(self):
+        if self.scaler is None:
+            return None
+        if self.scaler == "standard":
+            return StandardScaler()
+        if self.scaler == "robust":
+            return RobustScaler()
+        raise ValueError(f"Unknown scaler type: {self.scaler}")
+    
+    @staticmethod
+    def _to_float32(X):
+        # Only convert numeric columns; leave index/columns untouched
+        return X.astype(np.float32, copy=False)
 
     @property
     def xgb_config(self):
         if self.binary:
-            # scale_pos_weight = float(np.sum(self.y == 0)) / np.sum(self.y == 1)
-            # scale_pos_weight *= 2
+            scale_pos_weight = float(np.sum(self.y_train == 0)) / max(
+                float(np.sum(self.y_train == 1)), 1.0
+            )
             xgb_config = {
                 "objective": "binary:logistic",
-                "eval_metric": "logloss",
-                # "scale_pos_weight": scale_pos_weight,
+                "eval_metric": "aucpr",
+                "scale_pos_weight": scale_pos_weight,
             }
         else:
             xgb_config = {
                 "objective": "multi:softprob",
-                "eval_metric": "auc",
+                "eval_metric": "mlogloss",
                 "num_class": self.n_classes,
             }
 
-        xgb_config.update(
-            {
-                "eta": 0.05,
-                "gamma": 0.0,
-                # l1 regularization term on weights
-                "alpha": 1.0,
-                # l2 regularization term on weights
-                "lambda": 5.0,
-                "max_depth": 3,
-                # "max_delta_step": 5.0,
-                "subsample": 0.9,
-            }
-        )
+        defaults = {
+            "eta": 0.1,
+            "gamma": 1.0,
+            # l1 regularization term on weights
+            "alpha": 1.0,
+            # l2 regularization term on weights
+            "lambda": 5.0,
+            "max_depth": 4,
+            "subsample": 0.8,
+            "n_estimators": 200,
+            "tree_method": "hist",
+        }
+
+        xgb_config.update(defaults)
+        if self.xgb_params_override:
+            xgb_config.update(self.xgb_params_override)
 
         return xgb_config
 
     @property
     def probs(self):
-        if self.raw_probs is None:
-            raise ValueError(
-                "No predictions available. Call the `predict_proba` method first."
+        """Return ensemble-averaged probability estimates as a DataFrame."""
+        if self._probs_df is None:
+            raise RuntimeError(
+                "predict_proba() must be called before accessing `.probs`."
             )
-        probs = pd.DataFrame(self.raw_probs, index=self.X_test.index)
-        probs.columns = probs.columns.map(self.le_mapping)
-        return probs
+        return self._probs_df
 
     @property
     def predictions(self):
-        if self.raw_predictions is None:
-            raise ValueError(
-                "No predictions available. Call the `predict` method first."
+        """Return ensemble class predictions as a Series of labels."""
+        if self._pred_series is None:
+            raise RuntimeError(
+                "predict() must be called before accessing `.predictions`."
             )
-
-        predictions = pd.Series(self.raw_predictions.mode, index=self.X_test.index)
-        return predictions.map(self.le_mapping)
+        return self._pred_series
 
     @property
     def votes(self):
-        if self.raw_predictions is None:
-            raise ValueError(
-                "No predictions available. Call the `predict` method first."
-            )
+        """Return ensemble vote counts for the winning label per sample."""
+        if self._vote_series is None:
+            raise RuntimeError("predict() must be called before accessing `.votes`.")
+        return self._vote_series
 
-        return pd.Series(self.raw_predictions.count, index=self.X_test.index)
+    @property
+    def all_votes(self):
+        """
+        Return per-class vote counts for each sample.
+        Columns are class labels.
+        """
+        if self._all_votes_df is None:
+            raise RuntimeError(
+                "predict() must be called before accessing `.all_votes`."
+            )
+        return self._all_votes_df
 
     def _check_data(self, X):
         invalid_rows = X.index.isna()
@@ -162,13 +238,16 @@ class ConsensusClassifier:
         n_common = len(common_features)
         n_train_features = len(X_train.columns)
         percentage = 100 * (n_common / n_train_features)
-        if (n_common < n_train_features) and self.verbose:
-            logger.info(
+        if n_common < n_train_features:
+            self.log(
                 f"Found {n_common} out of {n_train_features} features ({percentage:.2f}%) in the test data."
             )
-
-        if self.verbose:
-            logger.info("Subsetting features of the test data...")
+        if n_common == 0:
+            raise ValueError(
+                "No common features found between training and test data. "
+                "Check that column names match."
+            )
+        self.log("Subsetting features of the test data...")
         X_train = X_train.loc[:, common_features].copy()
         X_test = X_test.loc[:, common_features].copy()
 
@@ -177,32 +256,35 @@ class ConsensusClassifier:
                 kf for kf in self.keep_features if kf in common_features
             ]
 
+        if self.n_features_per_model == "auto":
+
+            self.n_features_per_model = compute_required_features_per_model(
+                total_features=X_train.shape[1],
+                n_models=self.n_models,
+                target_coverage=0.95,
+            )
+
         if (
             self.n_features_per_model is None
             or self.n_features_per_model <= 0
-            or self.n_features_per_model > self.X_train.shape[1]
+            or self.n_features_per_model > X_train.shape[1]
         ):
-            self.n_features_per_model = self.X_train.shape[1]
+            self.n_features_per_model = X_train.shape[1]
 
-        if 0 < self.n_features_per_model < 1.0:
+        if 0 < self.n_features_per_model <= 1.0:
             self.n_features_per_model = int(
-                self.n_features_per_model * self.X_train.shape[1]
+                self.n_features_per_model * X_train.shape[1]
             )
 
-        if self.verbose:
-            logger.info(
-                f"Each model will be trained on {self.n_features_per_model} features."
-            )
+        self.log(f"Each model will be trained on {self.n_features_per_model} features.")
 
         return X_train, X_test
 
     def add_train_data(self, X, y, y_multi=None):
-        # self._reset()
-        if self.verbose:
-            logger.info("Checking training data...")
-        self.y_multi = y_multi
+        self.log("Checking training data...")
         self.X_train = self._check_data(X)
-        self.y_train = y.copy()
+        self.y_train = y.loc[self.X_train.index].copy()
+        self.y_multi = y_multi.loc[self.X_train.index].copy() if y_multi is not None else None
         self.le = LabelEncoder()
         self.le.fit(self.y_train)
         self.y_train = pd.Series(
@@ -224,225 +306,341 @@ class ConsensusClassifier:
                 self.n_samples_per_model * self.X_train.shape[0]
             )
 
-        if self.verbose:
-            logger.info(
-                f"Loaded training data with {self.X_train.shape[0]} samples and {self.X_train.shape[1]} features."
-            )
-            logger.info(f"Found {self.n_classes} classes in the training data.")
-            logger.info(
-                f"Each model will be trained on {self.n_samples_per_model} samples."
-            )
-            logger.info(
-                "Finished! Call the `add_test_data` method to load the test data."
-            )
+        self.log(
+            f"Loaded training data with {self.X_train.shape[0]} samples and {self.X_train.shape[1]} features."
+        )
+        self.log(f"Found {self.n_classes} classes in the training data.")
+        self.log(f"Each model will be trained on {self.n_samples_per_model} samples.")
+        self.log("Finished! Call the `add_test_data` method to load the test data.")
 
     def add_test_data(self, X):
-        # self._reset()
-        if self.verbose:
-            logger.info("Checking training data...")
+        if self.X_train is None:
+            raise RuntimeError("add_train_data() must be called before add_test_data().")
+        self.log("Checking test data...")
         self.X_test = self._check_data(X)
-        if self.verbose:
-            logger.info(
-                f"Loaded test data with {self.X_test.shape[0]} samples and {self.X_test.shape[1]} features."
-            )
+        self.log(
+            f"Loaded test data with {self.X_test.shape[0]} samples and {self.X_test.shape[1]} features."
+        )
 
         self.X_train, self.X_test = self._intersect_features(self.X_train, self.X_test)
 
-        if self.verbose:
-            logger.info("Finished! Call the `fit` method to train the classifiers.")
-    
-    def _fit_classifier(self, X, y, seed, model_idx):
-        seed += model_idx
-        xgb_config = self.xgb_config
-        xgb_config["seed"] = seed
-        xgb_clf = xgb.XGBClassifier(**xgb_config)
-        
-        # # Compute sample weights for imbalanced classes
-        # sample_weights = compute_sample_weight(class_weight="balanced", y=y)
+        self.X_train = self._to_float32(self.X_train)
+        self.X_test = self._to_float32(self.X_test)
 
-        # # Convert data to DMatrix format for custom loss function
-        # dtrain = xgb.DMatrix(X, label=y, weight=sample_weights)
-        
-        # loss_function = focal_loss(alpha=0.25, gamma=2.0)
-        # if not self.binary:
-        #     loss_function = focal_loss_multiclass(alpha=0.25, gamma=2.0)
+        self.classifier_list = []
+        self.feature_subset_list = []
+        self.scaler_list = []
+        self._X_test_cache.clear()
+        self.probs_list = []
+        self._probs_df = None
+        self._pred_series = None
+        self._vote_series = None
+        self._all_votes_df = None
 
-        # # Train using xgb.train() with the custom focal loss function
-        # xgb_clf._Booster = xgb.train(
-        #     params=xgb_config,  # Use the classifier's parameters
-        #     dtrain=dtrain,
-        #     num_boost_round=100,
-        #     obj=loss_function,
-        # )
-        
-        # xgb_clf.n_classes_ = self.n_classes  # Ensures proper class handling
-        # # xgb_clf.classes_ = np.unique(y)  # Fixes `n_classes_` error
-        
-        # return xgb_clf
-        
-        sample_weight = compute_sample_weight(class_weight="balanced", y=y)
-        sample_weight[(y == 1)] = sample_weight[(y == 1)] * self.scaling_factor
-        sample_weight = sample_weight * len(sample_weight) / sample_weight.sum()
+        self.log("Finished! Call the `fit` method to train the classifiers.")
 
-        return xgb_clf.fit(X, y, sample_weight=sample_weight)
+    if ray is not None:
+
+        @staticmethod
+        @ray.remote
+        def _fit_classifier_remote(xgb_config, X, y, model_idx, use_sample_weight):
+            clf = xgb.XGBClassifier(**xgb_config)
+            if use_sample_weight:
+                sample_weight = compute_sample_weight(class_weight="balanced", y=y)
+                return clf.fit(X, y, sample_weight=sample_weight), model_idx
+            return clf.fit(X, y), model_idx
+
+    @staticmethod
+    def _fit_classifier(xgb_config, X, y, use_sample_weight):
+        clf = xgb.XGBClassifier(**xgb_config)
+        if use_sample_weight:
+            sample_weight = compute_sample_weight(class_weight="balanced", y=y)
+            return clf.fit(X, y, sample_weight=sample_weight)
+        return clf.fit(X, y)
+
+    def _sample_samples_per_model(self, rng):
+        """
+        Stratified sampling of samples for one model.
+        Uses y_multi when provided, otherwise y_train.
+        Ensures at least one sample per class.
+        """
+        y_eff = self.y_multi if self.y_multi is not None else self.y_train
+        percentage = self.n_samples_per_model / len(self.y_train)
+
+        sample_subset = []
+        for label in y_eff.unique():
+            idx = y_eff.index[y_eff == label].to_numpy()
+            n_samples = max(1, int(len(idx) * percentage))
+            n_samples = min(n_samples, len(idx))
+            chosen = rng.choice(idx, size=n_samples, replace=False)
+            sample_subset.extend(chosen.tolist())
+
+        if self.keep_samples is not None:
+            sample_subset = list(set(sample_subset) | set(self.keep_samples))
+
+        return sample_subset
+
+    def _sample_features_per_model(self, rng):
+        """
+        Randomly sample features for one model, optionally union with keep_features.
+        """
+        cols = self.X_train.columns.to_numpy()
+        features = rng.choice(
+            cols, size=self.n_features_per_model, replace=False
+        ).tolist()
+
+        if self.keep_features is not None:
+            features = list(set(features) | set(self.keep_features))
+
+        return features
 
     def fit(self, seed=None):
+        """
+        Train the ensemble of XGBoost classifiers by repeatedly sampling
+        stratified sample subsets and feature subsets.
+        """
+        if self.X_train is None or self.y_train is None:
+            raise RuntimeError("add_train_data() must be called before fit().")
+        if self.X_test is None:
+            raise RuntimeError("add_test_data() must be called before fit().")
         rng = np.random.default_rng(seed)
-        if self.verbose:
-            logger.info("Training the classifiers...")
+        self.log("Training the classifiers...")
+        self._X_test_cache.clear()
+
         self.sample_subset_list = []
         self.feature_subset_list = []
         self.classifier_list = []
-        for model_idx in tqdm(range(self.n_models)):
+        self.probs_list = []
+        self._probs_df = None
+        self._pred_series = None
+        self._vote_series = None
+        self._all_votes_df = None
+        self.scaler_list = [None] * self.n_models
 
-            sample_subset = []
-            percentage = self.n_samples_per_model / len(self.y_train)
+        ray_tasks = []
 
-            # Group by class and sample
-            y_train_ = self.y_multi if self.y_multi is not None else self.y_train
-            for label, group in y_train_.groupby(y_train_):
-                n_samples = max(
-                    1, int(len(group) * percentage)
-                )  # At least one sample per class
-                sample_subset.extend(group.sample(n=n_samples).index)
+        iterator = range(self.n_models)
+        if not self.use_ray:
+            iterator = tqdm(
+                iterator, desc="Training ensemble", disable=not self.verbose
+            )
 
-            if self.keep_samples is not None:
-                sample_subset = list(set(sample_subset) | set(self.keep_samples))
-
-            feature_subset = rng.choice(
-                self.X_train.columns, size=self.n_features_per_model, replace=False
-            ).tolist()
-            if self.keep_features is not None:
-                feature_subset = list(set(feature_subset) | set(self.keep_features))
+        for model_idx in iterator:
+            # --- sample data ---
+            sample_subset = self._sample_samples_per_model(rng)
+            feature_subset = self._sample_features_per_model(rng)
 
             self.sample_subset_list.append(sample_subset)
             self.feature_subset_list.append(feature_subset)
-            X_train_sub = self.X_train.loc[sample_subset, feature_subset].copy()
-            y_train_sub = self.y_train.loc[sample_subset].copy()
-            if self.transform is not None:
-                X_train_sub = self.transform(X_train_sub)
-            classifier = self._fit_classifier(X_train_sub, y_train_sub, seed, model_idx)
-            self.classifier_list.append(classifier)
-        if self.verbose:
-            logger.info(
-                "Finished! Call the `predict` method to classify the test data."
-            )
-        return self.classifier_list
 
+            X_sub = self.X_train.loc[sample_subset, feature_subset]
+            y_sub = self.y_train.loc[sample_subset]
+            
+            scaler = self._make_scaler()
+            if scaler is not None:
+                X_sub = pd.DataFrame(
+                    scaler.fit_transform(X_sub),
+                    index=X_sub.index,
+                    columns=X_sub.columns,
+                )
+
+            self.scaler_list[model_idx] = scaler
+
+            cfg = self.xgb_config.copy()
+            cfg["random_state"] = (seed or 0) + model_idx
+
+            if self.use_ray and ray is not None:
+                ray_tasks.append(
+                    self._fit_classifier_remote.remote(
+                        xgb_config=cfg,
+                        X=X_sub,
+                        y=y_sub,
+                        model_idx=model_idx,
+                        use_sample_weight=not self.binary,
+                    )
+                )
+            else:
+                self.classifier_list.append(
+                    self._fit_classifier(
+                        xgb_config=cfg,
+                        X=X_sub,
+                        y=y_sub,
+                        use_sample_weight=not self.binary,
+                    )
+                )
+
+        if self.use_ray and ray is not None:
+            results = [None] * self.n_models
+
+            for clf, idx in ray_progress_bar(
+                ray_tasks, desc="Training ensemble", verbose=self.verbose
+            ):
+                results[idx] = clf
+
+            self.classifier_list = results
+            assert all(clf is not None for clf in self.classifier_list)
+        self.log("Finished! Call the `predict` method to classify the test data.")
+        return self.classifier_list
+    
     def _predict_proba(self):
+        """
+        Generate per-model probability predictions for the test set.
+        Results are stored in `self.probs_list` as numpy arrays.
+        """
+        X_test_full = self.X_test  # alias
+
         self.probs_list = []
-        for feature_subset, classifier in zip(
-            self.feature_subset_list, self.classifier_list
+        append = self.probs_list.append  # local binding is faster
+
+        for features, clf, scaler in zip(
+            self.feature_subset_list, self.classifier_list, self.scaler_list
         ):
-            X_test_sub = self.X_test.loc[:, feature_subset]
-            if self.transform is not None:
-                X_test_sub = self.transform(X_test_sub)
-            probs = classifier.predict_proba(X_test_sub)
-            self.probs_list.append(probs)
+            key = tuple(features)
+            if key not in self._X_test_cache:
+                # IMPORTANT: preserve original feature order for scaler
+                X_sub = X_test_full.loc[:, features]
+
+                if scaler is not None:
+                    X_sub = pd.DataFrame(
+                        scaler.transform(X_sub),
+                        index=X_sub.index,
+                        columns=X_sub.columns,
+                    )
+                    assert list(X_sub.columns) == list(scaler.feature_names_in_)
+
+                self._X_test_cache[key] = X_sub
+            else:
+                X_sub = self._X_test_cache[key]
+
+            append(clf.predict_proba(X_sub))
 
         return self.probs_list
 
+    @staticmethod
+    def _safe_logit(p):
+        """Convert probability p to logit with clipping for stability."""
+        p = np.clip(p, 1e-8, 1 - 1e-8)
+        return np.log(p / (1 - p))
+
+    @staticmethod
+    def _safe_sigmoid(x):
+        """Stable sigmoid."""
+        return 1.0 / (1.0 + np.exp(-x))
+
+    def _aggregate_binary_logits(self):
+        """
+        Aggregate binary ensemble predictions in logit space.
+        probs_list: list of (n_samples, 2) arrays.
+        Returns: (n_samples, 2) array.
+        """
+        # extract P(positive) for each model → shape (n_models, n_samples)
+        p1 = np.stack([p[:, 1] for p in self.probs_list], axis=0)
+
+        # convert each to logits
+        logits = self._safe_logit(p1)
+
+        # mean logit across models
+        mean_logits = logits.mean(axis=0)
+
+        # convert back to probability
+        p1_final = self._safe_sigmoid(mean_logits)
+        p0_final = 1.0 - p1_final
+
+        return np.stack([p0_final, p1_final], axis=1)
+
+    def _aggregate_multiclass_logits(self):
+        """
+        Aggregate multiclass probabilities in logit space.
+        probs_list: list of (n_samples, n_classes)
+        Returns: (n_samples, n_classes)
+        """
+        probs = np.stack(self.probs_list, axis=0)  # shape (M, N, C)
+
+        # clip
+        probs = np.clip(probs, 1e-8, 1 - 1e-8)
+
+        # compute logits per class
+        logits = np.log(probs)
+
+        # average logits across models
+        mean_logits = logits.mean(axis=0)  # (N, C)
+
+        # normalize back to probabilities
+        exp_logits = np.exp(mean_logits)
+        final = exp_logits / exp_logits.sum(axis=1, keepdims=True)
+
+        return final
+
     def predict_proba(self):
         if not self.classifier_list:
-            raise ValueError("No classifiers trained yet. Call the `fit` method first.")
+            raise ValueError("No classifiers trained yet. Call fit() first.")
 
         if len(self.probs_list) == 0:
             self._predict_proba()
-        agg_probs = np.mean(np.array(self.probs_list), axis=0)
-        agg_probs = np.exp(agg_probs) / np.exp(agg_probs).sum(axis=1)[:, None]
-        self.raw_probs = agg_probs
-        return self.probs
 
-    def predict(self):
-        if not self.classifier_list:
-            raise ValueError("No classifiers trained yet. Call the `fit` method first.")
+        if self.binary:
+            agg_probs = self._aggregate_binary_logits()
+        else:
+            agg_probs = self._aggregate_multiclass_logits()
 
-        self.raw_predictions = []
-        if len(self.probs_list) == 0:
-            self._predict_proba()
+        df = pd.DataFrame(
+            agg_probs,
+            index=self.X_test.index,
+            columns=[self.le_mapping[i] for i in range(agg_probs.shape[1])],
+        )
 
-        predictions = np.array([np.argmax(probs, axis=1) for probs in self.probs_list])
-        self.raw_predictions = stats.mode(predictions, axis=0)
-        return self.predictions
-
-    def _label_frequency(self, test=False):
-        y = self.y_train
-        if test:
-            y = self.raw_predictions
-        return np.unique(y, return_counts=True)
-
-    def _frequency_to_df(self, label, frequency):
-        df = pd.DataFrame({"Cluster": label, "Count": frequency})
-        df["Cluster"] = df["Cluster"].map(self.le_mapping)
-        df["Fraction"] = df["Count"] / df["Count"].sum()
+        self._probs_df = df
         return df
 
-    def get_label_frequency(self):
-        train_freq_df = self._frequency_to_df(*self._label_frequency(test=False))
-        train_freq_df["Type"] = "Train"
-        test_freq_df = self._frequency_to_df(*self._label_frequency(test=True))
-        test_freq_df["Type"] = "Test"
-        return pd.concat([train_freq_df, test_freq_df])
+    def predict(self):
+        """
+        Compute ensemble hard predictions and vote counts.
+        Populates:
+        - _all_votes_df : per-class vote counts
+        - _vote_series  : votes for winning class
+        - _pred_series  : predicted label
+        """
+        if not self.classifier_list:
+            raise RuntimeError("fit() must be called before predict().")
+
+        _ = self.predict_proba()  # ensure probs_list exists
+
+        # (n_models, n_samples)
+        hard_preds = np.stack([np.argmax(p, axis=1) for p in self.probs_list], axis=0)
+
+        # --- per-class vote counts ---
+        votes = {}
+        for class_idx, class_label in self.le_mapping.items():
+            votes[class_label] = (hard_preds == class_idx).sum(axis=0)
+
+        all_votes_df = pd.DataFrame(votes, index=self.X_test.index)
+
+        # --- winner: break vote ties via aggregated probabilities ---
+        max_votes = all_votes_df.max(axis=1)
+        is_tied = (all_votes_df == max_votes.values[:, None]).sum(axis=1) > 1
+        pred_labels = all_votes_df.idxmax(axis=1)
+        if is_tied.any():
+            prob_winner = self._probs_df.loc[is_tied].idxmax(axis=1)
+            pred_labels.loc[is_tied] = prob_winner
+        winner_votes = all_votes_df.max(axis=1)
+
+        self._all_votes_df = all_votes_df
+        self._pred_series = pred_labels
+        self._vote_series = winner_votes
+
+        return self._pred_series
 
     def export_results(self, path=None):
-        self.predict_proba()
-        self.predict()
-        results = pd.concat([self.probs, self.predictions, self.votes], axis=1)
-        results = results.rename(columns={0: "Cluster", 1: "Votes"})
+        preds = self.predict()
+        probs = self.probs
+        votes = self.all_votes
+
+        results = pd.concat(
+            [preds.rename("Prediction"), votes.add_prefix("votes_"), probs],
+            axis=1,
+        )
+
         if path is not None:
             results.to_csv(path)
+
         return results
-
-
-
-
-@click.command()
-@click.argument(
-    "data",
-    type=click.Path(exists=True, dir_okay=False),
-    # help="Path to input file (CSV).",
-)
-@click.option(
-    "-m", "--models", default=100, type=int, help="Number of models (default: 100)."
-)
-@click.option(
-    "-f",
-    "--features_per_model",
-    default=200,
-    type=int,
-    help="Number of features for each model (default: 100).",
-)
-@click.option(
-    "--fpkm/--no-fpkm",
-    default=False,
-    type=bool,
-    help="Whether to apply a z-score transformation (FPKM) or use a rank-based approach.",
-)
-@click.option(
-    "--out",
-    default="results.csv",
-    type=click.Path(dir_okay=False, writable=True),
-    help="Name of the CSV file to save results.",
-)
-def classify(data, models, features_per_model, fpkm, out):
-    use_z_scores = fpkm
-    use_ranks = not fpkm
-    seed = 0
-
-    clf = ConsensusClassifier(
-        n_models=models,
-        n_features_per_model=features_per_model,
-        use_ranks=use_ranks,
-        use_z_scores=use_z_scores,
-    )
-    X, y = _read_training_data()
-    clf.add_train_data(X, y)
-    clf.add_test_data(pd.read_csv(data, index_col=0))
-    clf.fit(seed=seed)
-    if out[-4:] != ".csv":
-        out += ".csv"
-    return clf.export_results(out)
-
-
-if __name__ == "__main__":
-    classify()
