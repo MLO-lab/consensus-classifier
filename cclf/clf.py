@@ -1,4 +1,5 @@
 import logging
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -83,6 +84,8 @@ class ConsensusClassifier:
         verbose=True,
         xgb_params_override=None,
         use_ray=False,
+        cluster_features=False,
+        aggregate_logits=True,
     ):
         if n_models < 1:
             raise ValueError(f"n_models must be at least 1, got {n_models}.")
@@ -104,6 +107,8 @@ class ConsensusClassifier:
         self.xgb_params_override = xgb_params_override
         if self.xgb_params_override is None:
             self.xgb_params_override = {}
+        self.cluster_features = cluster_features
+        self.aggregate_logits = aggregate_logits
         self.use_ray = use_ray
         if self.use_ray and ray is None:
             logger.warning(
@@ -122,6 +127,7 @@ class ConsensusClassifier:
 
         self.X_test = None
         self._X_test_cache = {}
+        self._feature_clusters = None
         
         self.scaler_list = []
         self.sample_subset_list = []
@@ -175,6 +181,7 @@ class ConsensusClassifier:
             "lambda": 5.0,
             "max_depth": 4,
             "subsample": 0.8,
+            "colsample_bylevel": 0.5,
             "n_estimators": 200,
             "tree_method": "hist",
         }
@@ -336,6 +343,10 @@ class ConsensusClassifier:
         self._pred_series = None
         self._vote_series = None
         self._all_votes_df = None
+        self._feature_clusters = None
+
+        if self.cluster_features:
+            self._compute_feature_clusters()
 
         self.log("Finished! Call the `fit` method to train the classifiers.")
 
@@ -380,14 +391,44 @@ class ConsensusClassifier:
 
         return sample_subset
 
+    def _compute_feature_clusters(self):
+        """Cluster features by co-expression profile using MiniBatchKMeans.
+
+        Features that co-vary across samples (e.g. interacting pairs) end up
+        in the same cluster, so cluster-based sampling keeps them together.
+        """
+        from sklearn.cluster import MiniBatchKMeans
+
+        n_features = self.X_train.shape[1]
+        cluster_size = 15
+        n_clusters = max(10, n_features // cluster_size)
+        self.log(f"Clustering {n_features} features into {n_clusters} groups ...")
+
+        km = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=3, batch_size=1024)
+        labels = km.fit_predict(self.X_train.values.T)
+
+        cols = self.X_train.columns.tolist()
+        buckets: dict[int, list] = defaultdict(list)
+        for feat_idx, cluster_id in enumerate(labels):
+            buckets[cluster_id].append(cols[feat_idx])
+        self._feature_clusters = list(buckets.values())
+        self.log(f"Feature clustering done. Avg cluster size: {n_features / n_clusters:.1f}")
+
     def _sample_features_per_model(self, rng):
-        """
-        Randomly sample features for one model, optionally union with keep_features.
-        """
-        cols = self.X_train.columns.to_numpy()
-        features = rng.choice(
-            cols, size=self.n_features_per_model, replace=False
-        ).tolist()
+        """Sample features for one model — cluster-aware or uniform random."""
+        if self._feature_clusters is not None:
+            cluster_order = rng.permutation(len(self._feature_clusters))
+            selected: list = []
+            for idx in cluster_order:
+                selected.extend(self._feature_clusters[int(idx)])
+                if len(selected) >= self.n_features_per_model:
+                    break
+            features = selected[:self.n_features_per_model]
+        else:
+            cols = self.X_train.columns.to_numpy()
+            features = rng.choice(
+                cols, size=self.n_features_per_model, replace=False
+            ).tolist()
 
         if self.keep_features is not None:
             features = list(set(features) | set(self.keep_features))
@@ -578,10 +619,14 @@ class ConsensusClassifier:
         if len(self.probs_list) == 0:
             self._predict_proba()
 
-        if self.binary:
-            agg_probs = self._aggregate_binary_logits()
+        if self.aggregate_logits:
+            if self.binary:
+                agg_probs = self._aggregate_binary_logits()
+            else:
+                agg_probs = self._aggregate_multiclass_logits()
         else:
-            agg_probs = self._aggregate_multiclass_logits()
+            # Arithmetic mean in probability space
+            agg_probs = np.stack(self.probs_list, axis=0).mean(axis=0)
 
         df = pd.DataFrame(
             agg_probs,
